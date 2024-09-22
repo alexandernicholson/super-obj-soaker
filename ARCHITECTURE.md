@@ -119,6 +119,7 @@ The downloader is the heart of the system, responsible for retrieving objects fr
   - **Connection Management**: Establishes connections to the S3-compatible SeaweedFS.
   - **Object Listing**: Retrieves a list of objects to be downloaded from the specified S3 bucket and prefix.
   - **Destination Management**: Handles download destinations, ensuring that directory structures are maintained correctly.
+- **Implementation**: Primarily uses multi-processing for concurrent downloads, with some internal threading from boto3 for specific S3 operations.
 
 #### Process Optimization
 
@@ -173,7 +174,8 @@ The downloader is the heart of the system, responsible for retrieving objects fr
 ## Concurrency and Synchronization
 
 - **Multiprocessing**: Utilizes Python's `multiprocessing` module to handle concurrent downloads across multiple processes, bypassing the Global Interpreter Lock (GIL) limitations.
-- **Shared Resources**: Employs shared variables and locks (`Value`, `Lock`) to manage shared state, such as download counts and process counts, ensuring thread-safe operations.
+- **Internal Threading**: Boto3 library uses threading internally for certain S3 operations, particularly when configured with `use_threads=True` in the `TransferConfig`.
+- **Shared Resources**: Employs shared variables and locks (`Value`, `Lock`) to manage shared state, such as download counts and process counts, ensuring thread-safe operations across processes.
 - **Event Flags**: Uses `Event` objects to signal shutdowns across all processes, facilitating coordinated termination.
 
 ## Logging and Monitoring
@@ -193,6 +195,7 @@ The downloader is the heart of the system, responsible for retrieving objects fr
 
 ## Scalability and Performance Considerations
 
+- **Multi-process Architecture**: By using multiple processes instead of threads, the system can fully utilize multiple CPU cores and bypass Python's Global Interpreter Lock (GIL), leading to improved performance for I/O-bound operations like downloading files.
 - **Dynamic Scaling**: The ability to adjust the number of worker processes based on real-time performance metrics ensures that the system can scale up to handle increased workloads without manual intervention.
 - **Resource Management**: By setting limits on maximum speed and process counts, the system prevents resource exhaustion, maintaining stability even under heavy loads.
 - **Efficient I/O Operations**: Utilizes optimized transfer configurations (e.g., multipart downloads) to handle large files effectively, balancing speed and resource usage.

@@ -1,6 +1,6 @@
 # Super Obj Soaker
 
-**Self-optimising Multi-threaded S3-Compatible Object Storage Downloader**
+**Self-optimising Multi-process S3-Compatible Object Storage Downloader**
 
 ## Table of Contents
 
@@ -25,7 +25,7 @@ Super Obj Soaker is a self-optimising, multi-threaded object storage downloader 
 ## Features
 
 - **Self-Optimising**: Dynamically adjusts the number of worker processes based on download performance to maximize efficiency.
-- **Multi-threaded**: Utilizes multiple processes to handle concurrent downloads, reducing overall download time.
+- **Multi-process**: Utilizes multiple processes to handle concurrent downloads, reducing overall download time and bypassing Python's Global Interpreter Lock (GIL).
 - **Resumable Downloads**: Supports resuming interrupted downloads, ensuring data integrity and reliability.
 - **Configurable Parameters**: Easily adjust settings such as minimum and maximum processes, download speed limits, and optimization intervals.
 - **S3-Compatible**: Works with any S3-compatible storage system, including local implementations for testing.
