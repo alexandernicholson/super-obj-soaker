@@ -27,22 +27,42 @@ logger.addHandler(handler)
 # Add a fixture to set optimization environment variables for all tests
 @pytest.fixture(scope="module", autouse=True)
 def set_optimization_env():
+    # Set S3 optimization environment variables
     os.environ['MIN_PROCESSES'] = '2'
     os.environ['MAX_PROCESSES'] = '10'
     os.environ['MAX_SPEED'] = '200'
     os.environ['OPTIMIZATION_INTERVAL'] = '1'
+    os.environ['MAX_RETRIES'] = '3'
+    os.environ['RETRY_DELAY'] = '1'
+    
+    # Set AWS-related environment variables
+    os.environ['AWS_ACCESS_KEY_ID'] = 'test'
+    os.environ['AWS_SECRET_ACCESS_KEY'] = 'test'
+    os.environ['AWS_DEFAULT_REGION'] = 'us-east-1'
+    os.environ['AWS_ENDPOINT_URL'] = 'http://seaweedfs:8333'
+    os.environ['S3_VERIFY_SSL'] = 'false'  # Disable SSL verification for testing
+    
     yield
-    # Optionally, reset environment variables after tests
-    del os.environ['MIN_PROCESSES']
-    del os.environ['MAX_PROCESSES']
-    del os.environ['MAX_SPEED']
-    del os.environ['OPTIMIZATION_INTERVAL']
+    
+    # Clean up environment variables after tests
+    env_vars = [
+        'MIN_PROCESSES', 'MAX_PROCESSES', 'MAX_SPEED', 'OPTIMIZATION_INTERVAL',
+        'MAX_RETRIES', 'RETRY_DELAY', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY',
+        'AWS_DEFAULT_REGION', 'AWS_ENDPOINT_URL', 'S3_VERIFY_SSL'
+    ]
+    for var in env_vars:
+        if var in os.environ:
+            del os.environ[var]
 
 @pytest.fixture(scope="module")
 def s3_client():
-    return boto3.client('s3', endpoint_url='http://seaweedfs:8333',
-                        aws_access_key_id='any', aws_secret_access_key='any',
-                        verify=False)
+    verify_ssl = os.environ.get('S3_VERIFY_SSL', 'true').lower() == 'true'
+    return boto3.client('s3',
+                        endpoint_url=os.environ['AWS_ENDPOINT_URL'],
+                        aws_access_key_id=os.environ['AWS_ACCESS_KEY_ID'],
+                        aws_secret_access_key=os.environ['AWS_SECRET_ACCESS_KEY'],
+                        region_name=os.environ['AWS_DEFAULT_REGION'],
+                        verify=verify_ssl)
 
 @pytest.fixture(scope="module")
 def test_bucket(s3_client):
@@ -92,6 +112,8 @@ def test_list_objects(s3_client, test_bucket):
     for i in range(5):
         s3_client.put_object(Bucket=test_bucket, Key=f'test_object_{i}', Body=os.urandom(1024 * 1024))  # 1MB objects
 
+    # Ensure S3_VERIFY_SSL is set before creating the downloader
+    os.environ['S3_VERIFY_SSL'] = 'false'
     downloader = S3OptimizedDownloader(test_bucket, '', '/tmp/test_destination', 'us-east-1', 'http://seaweedfs:8333')
     downloader.list_objects()
 

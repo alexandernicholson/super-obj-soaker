@@ -24,6 +24,7 @@ class S3OptimizedDownloader:
         
         self.region = region
         self.endpoint_url = endpoint_url
+        self.verify_ssl = os.environ.get('S3_VERIFY_SSL', 'true').lower() == 'true'
         self.s3 = self._create_s3_client()
 
         self.bucket = bucket
@@ -50,8 +51,7 @@ class S3OptimizedDownloader:
 
     def _create_s3_client(self):
         return boto3.client('s3', region_name=self.region, endpoint_url=self.endpoint_url,
-                            aws_access_key_id='any', aws_secret_access_key='any',
-                            verify=False)  # Disable SSL verification for local testing
+                            verify=self.verify_ssl)  # Disable SSL verification for local testing
 
     def list_objects(self):
         logger.info(f"Listing objects in s3://{self.bucket}/{self.prefix}")
