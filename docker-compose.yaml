@@ -1,0 +1,28 @@
+version: '3'
+services:
+  seaweedfs:
+    image: chrislusf/seaweedfs:3.73
+    ports:
+      - "8333:8333"  # S3 API
+      - "9333:9333"  # Master
+      - "8080:8080"  # Volume
+      - "8888:8888"  # Filer
+    command: "server -s3 -volume.max=5 -master.volumeSizeLimitMB=1024"
+
+  test-runner:
+    build: .
+    volumes:
+      - .:/app
+      - /tmp:/tmp
+    depends_on:
+      - seaweedfs
+    environment:
+      - MIN_PROCESSES=1
+      - MAX_PROCESSES=8
+      - MAX_SPEED=100
+      - OPTIMIZATION_INTERVAL=5
+    command: ["pytest", "-v"]
+
+networks:
+  default:
+    name: seaweedfs-network
