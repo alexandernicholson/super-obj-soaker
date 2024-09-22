@@ -20,7 +20,7 @@
 
 ## Introduction
 
-Super Obj Soaker is a self-optimising, multi-threaded object storage downloader designed to efficiently handle large-scale data retrieval tasks from S3-compatible storage systems. Leveraging Python's multiprocessing capabilities, this tool ensures high performance and scalability. Whether you're dealing with massive datasets or require reliable download operations, Super Obj Soaker provides a robust solution tailored to your needs.
+Super Obj Soaker is a self-optimising, multi-process object storage downloader designed to efficiently handle large-scale data retrieval tasks from S3-compatible storage systems. Leveraging Python's multiprocessing capabilities, this tool ensures high performance and scalability. Whether you're dealing with massive datasets or require reliable download operations, Super Obj Soaker provides a robust solution tailored to your needs.
 
 ## Features
 
