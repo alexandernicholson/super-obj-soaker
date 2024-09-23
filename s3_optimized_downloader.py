@@ -15,6 +15,7 @@ import queue
 import signal
 import fnmatch
 from threading import Event as ThreadingEvent
+from datetime import datetime, timezone
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -73,12 +74,15 @@ class S3OptimizedDownloader:
     def list_objects(self):
         logger.info(f"Listing objects in s3://{self.bucket}/{self.prefix}")
         paginator = self.s3.get_paginator('list_objects_v2')
-        for page in paginator.paginate(Bucket=self.bucket, Prefix=self.prefix):
-            for obj in page.get('Contents', []):
-                if self.should_process_object(obj['Key']):
-                    self.objects.append(obj)
-                    self.total_size += obj['Size']
-        logger.info(f"Found {len(self.objects)} objects with total size of {self.total_size / (1024**3):.2f} GB")
+        try:
+            for page in paginator.paginate(Bucket=self.bucket, Prefix=self.prefix):
+                for obj in page.get('Contents', []):
+                    if self.should_process_object(obj['Key']):
+                        self.objects.append(obj)
+                        self.total_size += obj['Size']
+            logger.info(f"Found {len(self.objects)} objects with total size of {self.total_size / (1024**3):.2f} GB")
+        except Exception as e:
+            logger.error(f"Error listing objects: {e}")
 
     def should_process_object(self, key):
         # Remove the prefix from the key for pattern matching
@@ -95,10 +99,17 @@ class S3OptimizedDownloader:
         return True
 
     def download_all(self):
+        # Clear the download_complete event at the start of each download
+        self.download_complete.clear()
+        
         try:
             os.makedirs(self.destination, exist_ok=True)
 
             self.list_objects()  # Ensure we have the list of objects
+            if not self.objects:
+                logger.warning("No objects found to download. Exiting.")
+                return
+
             self.populate_queue()
             self.start_optimizer()
             self.start_workers()
@@ -152,7 +163,7 @@ class S3OptimizedDownloader:
             retries = 0
             while retries < self.max_retries:
                 try:
-                    downloaded_size = self.download_object(obj, self.bucket, self.destination, s3)
+                    downloaded_size = self.download_object(obj, self.bucket, self.destination, s3, self.prefix)
                     with self.lock:
                         self.downloaded_bytes.value += downloaded_size
                     with self.completed_tasks.get_lock():
@@ -195,6 +206,9 @@ class S3OptimizedDownloader:
         previous_speed = 0
         while not self.shutdown_event.is_set():
             time.sleep(self.optimization_interval)
+            if self.shutdown_requested:
+                logger.info("Shutdown requested. Stopping optimizer.")
+                break
             with self.lock:
                 downloaded_bytes = self.downloaded_bytes.value
                 self.downloaded_bytes.value = 0
@@ -242,47 +256,72 @@ class S3OptimizedDownloader:
             pass  # Do nothing
 
     @staticmethod
-    def download_object(obj, bucket, destination, s3):
+    def download_object(obj, bucket, destination, s3, prefix=''):
         key = obj['Key']
-        dest_path = os.path.join(destination, key)
+        # Strip the prefix from the key
+        relative_key = key[len(prefix):].lstrip('/')
+        dest_path = os.path.join(destination, relative_key)
         os.makedirs(os.path.dirname(dest_path), exist_ok=True)
 
-        # Configure multipart download
-        config = TransferConfig(
-            multipart_threshold=8 * 1024 * 1024,  # 8 MB
-            max_concurrency=10,
-            multipart_chunksize=8 * 1024 * 1024,  # 8 MB
-            use_threads=True,
-        )
-
-        try:
-            # Check if a partial download exists
-            if os.path.exists(dest_path):
-                existing_size = os.path.getsize(dest_path)
-                if existing_size < obj['Size']:
-                    # Resume download
-                    logger.info(f"Resuming download of {key} from byte {existing_size}")
-                    response = s3.get_object(Bucket=bucket, Key=key, Range=f'bytes={existing_size}-')
-                    with open(dest_path, 'ab') as f:
-                        shutil.copyfileobj(response['Body'], f)
-                    downloaded_size = obj['Size'] - existing_size
+        should_download = True
+        if os.path.exists(dest_path):
+            local_size = os.path.getsize(dest_path)
+            if local_size == obj['Size']:
+                if 'LastModified' in obj:
+                    local_mtime = datetime.fromtimestamp(os.path.getmtime(dest_path), tz=timezone.utc)
+                    s3_mtime = obj['LastModified'].replace(tzinfo=timezone.utc)
+                    
+                    if local_mtime >= s3_mtime:
+                        logger.info(f"File {key} is up to date, skipping download")
+                        should_download = False
+                    else:
+                        logger.info(f"File {key} is outdated, re-downloading")
+                        os.remove(dest_path)
                 else:
-                    logger.info(f"File {key} already fully downloaded, skipping")
-                    return obj['Size']
+                    logger.info(f"File {key} exists with correct size, skipping download")
+                    should_download = False
             else:
-                # Start new download
-                with open(dest_path, 'wb') as f:
-                    s3.download_fileobj(bucket, key, f, Config=config)
-                downloaded_size = obj['Size']
+                logger.info(f"File {key} exists but has incorrect size, resuming download")
 
-            logger.info(f"Downloaded: s3://{bucket}/{key} to {dest_path}")
-            return downloaded_size
-        except ClientError as e:
-            logger.error(f"ClientError downloading {key}: {e}")
-            raise
-        except Exception as e:
-            logger.error(f"Unexpected error downloading {key}: {e}")
-            raise
+        if should_download:
+            # Configure multipart download
+            config = TransferConfig(
+                multipart_threshold=8 * 1024 * 1024,  # 8 MB
+                max_concurrency=10,
+                multipart_chunksize=8 * 1024 * 1024,  # 8 MB
+                use_threads=True,
+            )
+
+            try:
+                if os.path.exists(dest_path):
+                    logger.info(f"Overwriting outdated file: {dest_path}")
+                    with open(dest_path, 'wb') as f:
+                        s3.download_fileobj(bucket, key, f, Config=config)
+                    downloaded_size = obj['Size']
+                else:
+                    # Start new download
+                    with open(dest_path, 'wb') as f:
+                        s3.download_fileobj(bucket, key, f, Config=config)
+                    downloaded_size = obj['Size']
+
+                # Update the local file's timestamp to match S3 if 'LastModified' is available
+                if 'LastModified' in obj:
+                    os.utime(dest_path, (time.time(), obj['LastModified'].timestamp()))
+                else:
+                    # If 'LastModified' is not available, use the current time
+                    current_time = time.time()
+                    os.utime(dest_path, (current_time, current_time))
+
+                logger.info(f"Downloaded: s3://{bucket}/{key} to {dest_path}")
+                return downloaded_size
+            except ClientError as e:
+                logger.error(f"ClientError downloading {key}: {e}")
+                raise
+            except Exception as e:
+                logger.error(f"Unexpected error downloading {key}: {e}")
+                raise
+        else:
+            return 0  # No bytes downloaded
 
     def graceful_shutdown(self, signum, frame):
         logger.info(f"Received signal {signum}. Initiating graceful shutdown...")

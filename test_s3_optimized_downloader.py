@@ -11,6 +11,7 @@ from multiprocessing import Value
 import stat
 import fnmatch
 import uuid
+from datetime import datetime, timezone
 
 # Set up logging
 logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(message)s', stream=sys.stdout)
@@ -137,12 +138,12 @@ def test_download_object(s3_client, test_bucket, unique_prefix):
     s3 = downloader._create_s3_client()
     obj = {'Key': f'{unique_prefix}test_download', 'Size': len(test_data)}
     downloaded_size = downloader.download_object(
-        obj, downloader.bucket, downloader.destination, s3
+        obj, downloader.bucket, downloader.destination, s3, downloader.prefix
     )
 
     assert downloaded_size == len(test_data)
     
-    expected_file_path = os.path.join('/tmp/test_destination', unique_prefix, 'test_download')
+    expected_file_path = os.path.join('/tmp/test_destination', 'test_download')
     assert os.path.exists(expected_file_path), f"Downloaded file not found at {expected_file_path}"
     
     with open(expected_file_path, 'rb') as f:
@@ -161,7 +162,7 @@ def test_download_large_file(s3_client, test_bucket, unique_prefix):
     download_time = end_time - start_time
     download_speed = large_file_size / download_time / (1024 * 1024)  # MB/s
 
-    expected_file_path = os.path.join('/tmp/test_destination', unique_prefix, 'large_file')
+    expected_file_path = os.path.join('/tmp/test_destination', 'large_file')
     assert os.path.exists(expected_file_path), f"File not found at {expected_file_path}"
     assert os.path.getsize(expected_file_path) == large_file_size, f"File size mismatch. Expected {large_file_size}, got {os.path.getsize(expected_file_path)}"
     assert download_speed > 1, f"Download speed too low: {download_speed:.2f} MB/s"
@@ -173,14 +174,17 @@ def test_download_many_small_files(s3_client, test_bucket, unique_prefix):
     num_files = 1000
     file_size = 10 * 1024  # 10 KB
 
+    # Create a unique destination directory for this test
+    test_destination = f'/tmp/test_destination_{uuid.uuid4().hex}'
+
     logger.info(f"Creating {num_files} small files in S3 bucket")
     for i in range(num_files):
         key = f'{unique_prefix}small_file_{i}'
         s3_client.put_object(Bucket=test_bucket, Key=key, Body=os.urandom(file_size))
         logger.info(f"Created file: {key}")
 
-    downloader = S3OptimizedDownloader(test_bucket, unique_prefix, '/tmp/test_destination', 'us-east-1', 'http://seaweedfs:8333')
-    
+    downloader = S3OptimizedDownloader(test_bucket, unique_prefix, test_destination, 'us-east-1', 'http://seaweedfs:8333')
+
     try:
         # Start the download in a separate thread to allow optimization
         import threading
@@ -207,8 +211,10 @@ def test_download_many_small_files(s3_client, test_bucket, unique_prefix):
         if not download_complete:
             logger.warning("Download did not complete within the timeout.")
         
-        download_dir = os.path.join('/tmp/test_destination', unique_prefix)
-        download_files = os.listdir(download_dir)
+        download_files = []
+        for root, dirs, files in os.walk(test_destination):
+            for file in files:
+                download_files.append(os.path.relpath(os.path.join(root, file), test_destination))
         logger.info(f"Number of files in destination: {len(download_files)}")
 
         # List files in S3 bucket for comparison
@@ -216,8 +222,7 @@ def test_download_many_small_files(s3_client, test_bucket, unique_prefix):
         paginator = s3_client.get_paginator('list_objects_v2')
         for page in paginator.paginate(Bucket=test_bucket, Prefix=unique_prefix):
             for obj in page.get('Contents', []):
-                if obj['Key'].startswith(f'{unique_prefix}small_file_'):
-                    s3_files.append(os.path.basename(obj['Key']))  # Only keep the filename
+                s3_files.append(os.path.relpath(obj['Key'], unique_prefix))
 
         logger.info(f"Number of files in S3 bucket: {len(s3_files)}")
 
@@ -231,6 +236,9 @@ def test_download_many_small_files(s3_client, test_bucket, unique_prefix):
         if download_thread.is_alive():
             download_thread.join(timeout=5)
         logger.info("Test completed, all processes terminated.")
+
+        # Clean up the test directory
+        shutil.rmtree(test_destination, ignore_errors=True)
 
 def test_process_count_optimization(s3_client, test_bucket, unique_prefix):
     logger.info("Starting test_process_count_optimization")
@@ -286,27 +294,15 @@ def test_resume_interrupted_download(s3_client, test_bucket, unique_prefix):
     downloader = S3OptimizedDownloader(test_bucket, unique_prefix, '/tmp/test_destination', 'us-east-1', 'http://seaweedfs:8333')
     
     # Simulate partial download
-    partial_file_path = os.path.join('/tmp/test_destination', unique_prefix, 'resume_file')
+    partial_file_path = os.path.join('/tmp/test_destination', 'resume_file')
     os.makedirs(os.path.dirname(partial_file_path), exist_ok=True)
     with open(partial_file_path, 'wb') as f:
         f.write(os.urandom(10 * 1024 * 1024))  # Write 10 MB
 
-    # Start the download in a separate thread
-    import threading
-    download_thread = threading.Thread(target=downloader.download_all)
-    download_thread.start()
+    # Start the download
+    downloader.download_all()
 
-    # Wait for the download to complete or timeout after 30 seconds
-    download_thread.join(timeout=30)
-
-    # If the thread is still alive, terminate the download
-    if download_thread.is_alive():
-        logger.warning("Download did not complete within the timeout. Terminating...")
-        downloader.shutdown_event.set()
-        downloader.terminate_processes()
-        download_thread.join()
-
-    expected_file_path = os.path.join('/tmp/test_destination', unique_prefix, 'resume_file')
+    expected_file_path = os.path.join('/tmp/test_destination', 'resume_file')
     assert os.path.exists(expected_file_path), f"File not found at {expected_file_path}"
     assert os.path.getsize(expected_file_path) == file_size, f"File size mismatch. Expected {file_size}, got {os.path.getsize(expected_file_path)}"
 
@@ -365,7 +361,12 @@ def test_include_exclude_patterns(s3_client, test_bucket, unique_prefix):
         )
         downloader.download_all()
 
-        downloaded_files = os.listdir(os.path.join(case_destination, unique_prefix))
+        downloaded_files = []
+        for root, _, files in os.walk(case_destination):
+            for file in files:
+                rel_path = os.path.relpath(os.path.join(root, file), case_destination)
+                downloaded_files.append(rel_path.replace('\\', '/'))  # Normalize path separators
+
         assert set(downloaded_files) == set(case['expected']), \
             f"Case {i + 1}: Expected {case['expected']}, but got {downloaded_files}"
 
@@ -402,10 +403,70 @@ def test_complex_include_exclude_patterns(s3_client, test_bucket, unique_prefix)
 
     # Check if the correct files were downloaded
     downloaded_files = []
-    for root, _, files in os.walk(os.path.join('/tmp/test_destination/complex', unique_prefix)):
+    for root, _, files in os.walk(os.path.join('/tmp/test_destination/complex')):
         for file in files:
-            rel_path = os.path.relpath(os.path.join(root, file), os.path.join('/tmp/test_destination/complex', unique_prefix))
+            rel_path = os.path.relpath(os.path.join(root, file), os.path.join('/tmp/test_destination/complex'))
             downloaded_files.append(rel_path.replace('\\', '/'))  # Normalize path separators
 
     assert set(downloaded_files) == set(expected_files), \
         f"Expected {expected_files}, but got {downloaded_files}"
+
+def test_timestamp_comparison(s3_client, test_bucket, unique_prefix):
+    logger.info("Starting test_timestamp_comparison")
+    file_content = b'test content'
+    file_key = f'{unique_prefix}timestamp_test_file.txt'
+
+    # Upload a file
+    s3_client.put_object(Bucket=test_bucket, Key=file_key, Body=file_content)
+
+    def download_with_timeout(downloader, timeout=30):
+        import threading
+        download_thread = threading.Thread(target=downloader.download_all)
+        download_thread.start()
+        download_thread.join(timeout)
+        if download_thread.is_alive():
+            logger.error("Download operation timed out")
+            raise TimeoutError("Download operation timed out")
+
+    # First download
+    downloader = S3OptimizedDownloader(test_bucket, unique_prefix, '/tmp/test_destination', 'us-east-1', 'http://seaweedfs:8333')
+    download_with_timeout(downloader)
+
+    # Get the local file's modification time
+    local_file_path = os.path.join('/tmp/test_destination', 'timestamp_test_file.txt')
+    initial_mtime = os.path.getmtime(local_file_path)
+
+    # Wait a moment to ensure different timestamps
+    time.sleep(1)
+
+    # Second download without modifying the S3 object
+    downloader = S3OptimizedDownloader(test_bucket, unique_prefix, '/tmp/test_destination', 'us-east-1', 'http://seaweedfs:8333')
+    download_with_timeout(downloader)
+
+    # Check that the local file wasn't updated
+    assert os.path.getmtime(local_file_path) == initial_mtime, "File was unnecessarily downloaded"
+
+    # Modify the S3 object
+    s3_client.put_object(Bucket=test_bucket, Key=file_key, Body=b'updated content')
+
+    # Wait a moment to ensure different timestamps
+    time.sleep(1)
+
+    # Third download after modifying the S3 object
+    downloader = S3OptimizedDownloader(test_bucket, unique_prefix, '/tmp/test_destination', 'us-east-1', 'http://seaweedfs:8333')
+    download_with_timeout(downloader)
+
+    # Check that the local file was updated
+    assert os.path.getmtime(local_file_path) > initial_mtime, "File was not updated when S3 object changed"
+
+    # Verify the content was updated
+    with open(local_file_path, 'rb') as f:
+        assert f.read() == b'updated content', "File content was not updated"
+
+    # Try to download again without modifying the S3 object
+    initial_mtime = os.path.getmtime(local_file_path)
+    downloader = S3OptimizedDownloader(test_bucket, unique_prefix, '/tmp/test_destination', 'us-east-1', 'http://seaweedfs:8333')
+    download_with_timeout(downloader)
+
+    # Check that the local file wasn't updated
+    assert os.path.getmtime(local_file_path) == initial_mtime, "File was unnecessarily downloaded after update"
