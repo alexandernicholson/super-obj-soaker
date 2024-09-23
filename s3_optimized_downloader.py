@@ -12,13 +12,15 @@ import urllib3
 import multiprocessing
 from multiprocessing import Process, Queue, Lock, Value, Event
 import signal
+import fnmatch
+from threading import Event as ThreadingEvent
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 class S3OptimizedDownloader:
-    def __init__(self, bucket, prefix, destination, region, endpoint_url=None):
+    def __init__(self, bucket, prefix, destination, region, endpoint_url=None, include_patterns=None, exclude_patterns=None):
         # Disable warnings for self-signed certificates
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
         
@@ -48,6 +50,9 @@ class S3OptimizedDownloader:
         self.retry_delay = float(os.environ.get('RETRY_DELAY', '5'))  # seconds
         # Shared value for process count
         self.process_count = Value('i', self.min_processes)
+        self.include_patterns = include_patterns or []
+        self.exclude_patterns = exclude_patterns or []
+        self.download_complete = ThreadingEvent()
 
     def _create_s3_client(self):
         return boto3.client('s3', region_name=self.region, endpoint_url=self.endpoint_url,
@@ -58,9 +63,24 @@ class S3OptimizedDownloader:
         paginator = self.s3.get_paginator('list_objects_v2')
         for page in paginator.paginate(Bucket=self.bucket, Prefix=self.prefix):
             for obj in page.get('Contents', []):
-                self.objects.append(obj)
-                self.total_size += obj['Size']
+                if self.should_process_object(obj['Key']):
+                    self.objects.append(obj)
+                    self.total_size += obj['Size']
         logger.info(f"Found {len(self.objects)} objects with total size of {self.total_size / (1024**3):.2f} GB")
+
+    def should_process_object(self, key):
+        # Remove the prefix from the key for pattern matching
+        relative_key = key[len(self.prefix):].lstrip('/')
+        
+        # If there are include patterns, the key must match at least one
+        if self.include_patterns and not any(fnmatch.fnmatch(relative_key, pattern) for pattern in self.include_patterns):
+            return False
+        
+        # If there are exclude patterns, the key must not match any
+        if self.exclude_patterns and any(fnmatch.fnmatch(relative_key, pattern) for pattern in self.exclude_patterns):
+            return False
+        
+        return True
 
     def download_all(self):
         try:
@@ -84,6 +104,7 @@ class S3OptimizedDownloader:
                 self.optimizer_process.join()
 
             logger.info("Download completed")
+            self.download_complete.set()  # Signal that download is complete
         except KeyboardInterrupt:
             logger.info("Shutdown signal received. Terminating processes...")
             self.shutdown_event.set()
@@ -252,6 +273,8 @@ def main():
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"],
                         help="Set the logging level")
     parser.add_argument("--endpoint-url", help="Custom S3 endpoint URL")
+    parser.add_argument("--include", action='append', help="Pattern to include files (can be used multiple times)")
+    parser.add_argument("--exclude", action='append', help="Pattern to exclude files (can be used multiple times)")
     args = parser.parse_args()
 
     logger.setLevel(args.log_level)
@@ -266,7 +289,8 @@ def main():
         bucket = args.source[5:]
         prefix = ''
 
-    downloader = S3OptimizedDownloader(bucket, prefix, args.destination, args.region, args.endpoint_url)
+    downloader = S3OptimizedDownloader(bucket, prefix, args.destination, args.region, args.endpoint_url,
+                                       include_patterns=args.include, exclude_patterns=args.exclude)
 
     # Register signal handlers for graceful shutdown
     def signal_handler(signum, frame):

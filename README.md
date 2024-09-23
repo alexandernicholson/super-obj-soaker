@@ -30,6 +30,7 @@ Super Obj Soaker is an advanced S3 downloader that significantly improves upon t
 - **Configurable Parameters**: Easily adjust settings such as minimum and maximum processes, download speed limits, and optimization intervals.
 - **S3-Compatible**: Works with any S3-compatible storage system, including local implementations for testing.
 - **Comprehensive Error Handling**: Implements retry mechanisms and graceful shutdowns for improved reliability.
+- **Include/Exclude Patterns**: Supports filtering of files to download based on include and exclude patterns, similar to the AWS CLI S3 sync command.
 
 ## Architecture
 
@@ -118,6 +119,8 @@ The downloader can be executed via the command line with customizable parameters
 - `--region`: AWS region *(Default: us-east-1)*
 - `--log-level`: Set the logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) *(Default: INFO)*
 - `--endpoint-url`: Custom S3 endpoint URL
+- `--include`: Pattern to include files (can be used multiple times)
+- `--exclude`: Pattern to exclude files (can be used multiple times)
 
 ### Examples
 
@@ -137,6 +140,17 @@ The downloader can be executed via the command line with customizable parameters
 
    ```bash
    python s3_optimized_downloader.py s3://mybucket/data /local/path --endpoint-url http://localhost:8333
+   ```
+
+4. **Using Include and Exclude Patterns**
+
+   ```bash
+   python s3_optimized_downloader.py s3://mybucket/data /local/path --exclude "*" --include "*.db"
+   ```
+
+   This example will download only files with the `.db` extension, similar to the AWS CLI command:
+   ```
+   aws s3 sync s3://mybucket/data . --exclude "*" --include "*.db"
    ```
 
 ## Testing
