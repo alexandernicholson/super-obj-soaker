@@ -11,6 +11,7 @@ from boto3.s3.transfer import TransferConfig
 import urllib3
 import multiprocessing
 from multiprocessing import Process, Queue, Lock, Value, Event
+import queue
 import signal
 import fnmatch
 from threading import Event as ThreadingEvent
@@ -50,6 +51,8 @@ class S3OptimizedDownloader:
         self.optimization_interval = float(os.environ.get('OPTIMIZATION_INTERVAL', '10'))  # Default to 10 seconds
         self.total_size = 0
         self.task_queue = Queue()
+        self.completed_tasks = Value('i', 0)
+        self.total_tasks = Value('i', 0)
         self.lock = Lock()
         self.processes = []
         self.optimizer_process = None
@@ -100,10 +103,9 @@ class S3OptimizedDownloader:
             self.start_optimizer()
             self.start_workers()
 
-            # Wait for all worker processes to finish or shutdown to be requested
-            while any(p.is_alive() for p in self.processes) and not self.shutdown_requested:
-                for process in self.processes:
-                    process.join(timeout=1.0)
+            # Wait for all tasks to complete or shutdown to be requested
+            while self.completed_tasks.value < self.total_tasks.value and not self.shutdown_requested:
+                time.sleep(1)
 
             # Terminate the optimizer process if it's still running
             if self.optimizer_process and self.optimizer_process.is_alive():
@@ -120,6 +122,8 @@ class S3OptimizedDownloader:
     def populate_queue(self):
         for obj in self.objects:
             self.task_queue.put(obj)
+            with self.total_tasks.get_lock():
+                self.total_tasks.value += 1
             logger.debug(f"Task queued for object: {obj['Key']}")
 
     def start_workers(self):
@@ -138,10 +142,11 @@ class S3OptimizedDownloader:
         s3 = self._create_s3_client()
         while not self.shutdown_event.is_set():
             try:
-                obj = self.task_queue.get(timeout=1)  # Use a timeout to check shutdown_event periodically
-            except Queue.Empty:
+                obj = self.task_queue.get(timeout=1)
+            except queue.Empty:
                 continue
-            except Exception:
+            except Exception as e:
+                logger.error(f"Error getting task from queue: {e}")
                 break
 
             retries = 0
@@ -150,6 +155,8 @@ class S3OptimizedDownloader:
                     downloaded_size = self.download_object(obj, self.bucket, self.destination, s3)
                     with self.lock:
                         self.downloaded_bytes.value += downloaded_size
+                    with self.completed_tasks.get_lock():
+                        self.completed_tasks.value += 1
                     break  # Success, exit retry loop
                 except Exception as e:
                     retries += 1
@@ -157,6 +164,8 @@ class S3OptimizedDownloader:
                     time.sleep(self.retry_delay)
             else:
                 logger.error(f"Failed to download {obj['Key']} after {self.max_retries} retries")
+                with self.completed_tasks.get_lock():
+                    self.completed_tasks.value += 1
 
     def worker_signal_handler(self, signum, frame):
         logger.info(f"Worker process received signal {signum}. Initiating graceful shutdown...")
@@ -253,14 +262,9 @@ class S3OptimizedDownloader:
                 if existing_size < obj['Size']:
                     # Resume download
                     logger.info(f"Resuming download of {key} from byte {existing_size}")
+                    response = s3.get_object(Bucket=bucket, Key=key, Range=f'bytes={existing_size}-')
                     with open(dest_path, 'ab') as f:
-                        s3.download_fileobj(
-                            bucket, 
-                            key, 
-                            f, 
-                            Config=config,
-                            ExtraArgs={'Range': f'bytes={existing_size}-'}
-                        )
+                        shutil.copyfileobj(response['Body'], f)
                     downloaded_size = obj['Size'] - existing_size
                 else:
                     logger.info(f"File {key} already fully downloaded, skipping")
