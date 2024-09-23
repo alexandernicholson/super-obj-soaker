@@ -19,6 +19,14 @@ from threading import Event as ThreadingEvent
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# At the beginning of the script, set the start method to 'fork' if available
+if hasattr(multiprocessing, 'get_start_method'):
+    try:
+        multiprocessing.set_start_method('fork')
+    except RuntimeError:
+        # If it's already set and we can't change it, that's okay
+        pass
+
 class S3OptimizedDownloader:
     def __init__(self, bucket, prefix, destination, region, endpoint_url=None, include_patterns=None, exclude_patterns=None):
         # Disable warnings for self-signed certificates
@@ -53,6 +61,7 @@ class S3OptimizedDownloader:
         self.include_patterns = include_patterns or []
         self.exclude_patterns = exclude_patterns or []
         self.download_complete = ThreadingEvent()
+        self.shutdown_requested = False
 
     def _create_s3_client(self):
         return boto3.client('s3', region_name=self.region, endpoint_url=self.endpoint_url,
@@ -91,24 +100,21 @@ class S3OptimizedDownloader:
             self.start_optimizer()
             self.start_workers()
 
-            # Wait for all worker processes to finish
-            for process in self.processes:
-                process.join()
+            # Wait for all worker processes to finish or shutdown to be requested
+            while any(p.is_alive() for p in self.processes) and not self.shutdown_requested:
+                for process in self.processes:
+                    process.join(timeout=1.0)
 
-            # Terminate the optimizer process
-            if self.optimizer_process.is_alive():
+            # Terminate the optimizer process if it's still running
+            if self.optimizer_process and self.optimizer_process.is_alive():
                 self.optimizer_process.terminate()
                 self.optimizer_process.join()
 
-            logger.info("Download completed")
+            logger.info("Download completed or shutdown requested")
             self.download_complete.set()  # Signal that download is complete
-        except KeyboardInterrupt:
-            logger.info("Shutdown signal received. Terminating processes...")
-            self.shutdown_event.set()
-            self.terminate_processes()
         except Exception as e:
             logger.error(f"An unexpected error occurred: {e}")
-            self.shutdown_event.set()
+        finally:
             self.terminate_processes()
 
     def populate_queue(self):
@@ -125,12 +131,19 @@ class S3OptimizedDownloader:
             logger.info(f"Worker process {worker.pid} started. Total workers: {len(self.processes)}")
 
     def worker_download(self):
+        # Set up signal handlers for the worker process
+        signal.signal(signal.SIGTERM, self.worker_signal_handler)
+        signal.signal(signal.SIGINT, self.worker_signal_handler)
+
         s3 = self._create_s3_client()
         while not self.shutdown_event.is_set():
             try:
-                obj = self.task_queue.get_nowait()
-            except:
+                obj = self.task_queue.get(timeout=1)  # Use a timeout to check shutdown_event periodically
+            except Queue.Empty:
+                continue
+            except Exception:
                 break
+
             retries = 0
             while retries < self.max_retries:
                 try:
@@ -145,10 +158,15 @@ class S3OptimizedDownloader:
             else:
                 logger.error(f"Failed to download {obj['Key']} after {self.max_retries} retries")
 
+    def worker_signal_handler(self, signum, frame):
+        logger.info(f"Worker process received signal {signum}. Initiating graceful shutdown...")
+        self.shutdown_event.set()
+
     def terminate_processes(self):
+        self.shutdown_event.set()
         # Terminate worker processes
         for process in self.processes:
-            if process.is_alive():
+            if process and process.is_alive():
                 process.terminate()
                 process.join()
                 logger.info(f"Terminated worker process {process.pid}.")
@@ -262,6 +280,11 @@ class S3OptimizedDownloader:
             logger.error(f"Unexpected error downloading {key}: {e}")
             raise
 
+    def graceful_shutdown(self, signum, frame):
+        logger.info(f"Received signal {signum}. Initiating graceful shutdown...")
+        self.shutdown_requested = True
+        self.shutdown_event.set()
+
 def main():
     parser = argparse.ArgumentParser(description="S3 Optimized Downloader")
     parser.add_argument("source", help="Source S3 URI (s3://bucket/prefix)")
@@ -290,15 +313,17 @@ def main():
                                        include_patterns=args.include, exclude_patterns=args.exclude)
 
     # Register signal handlers for graceful shutdown
-    def signal_handler(signum, frame):
-        logger.info(f"Received signal {signum}. Initiating graceful shutdown...")
-        downloader.shutdown_event.set()
+    signal.signal(signal.SIGTERM, downloader.graceful_shutdown)
+    signal.signal(signal.SIGINT, downloader.graceful_shutdown)
+
+    # Use this instead of directly calling download_all
+    try:
+        downloader.download_all()
+    except KeyboardInterrupt:
+        logger.info("Keyboard interrupt received. Initiating graceful shutdown...")
+        downloader.graceful_shutdown(signal.SIGINT, None)
+    finally:
         downloader.terminate_processes()
-
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-
-    downloader.download_all()
 
     # Log the optimization interval
     optimization_interval = os.environ.get('OPTIMIZATION_INTERVAL', '10')
