@@ -80,7 +80,7 @@ You can set up Super Obj Soaker using either a virtual environment or Docker.
 1. **Clone the Repository**
 
    ```bash
-   git clone https://github.com/yourusername/super-obj-soaker.git
+   git clone https://github.com/alexandernicholson/super-obj-soaker.git
    cd super-obj-soaker
    ```
 
