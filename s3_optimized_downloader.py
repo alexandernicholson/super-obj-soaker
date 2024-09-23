@@ -84,9 +84,6 @@ class S3OptimizedDownloader:
 
     def download_all(self):
         try:
-            # Clear the destination directory
-            if os.path.exists(self.destination):
-                shutil.rmtree(self.destination)
             os.makedirs(self.destination, exist_ok=True)
 
             self.list_objects()  # Ensure we have the list of objects
