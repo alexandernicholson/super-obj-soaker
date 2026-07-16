@@ -2,6 +2,7 @@ import argparse
 import boto3
 import logging
 import os
+import re
 import time
 import shutil
 from botocore.exceptions import ClientError
@@ -20,6 +21,11 @@ from datetime import datetime, timezone
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# s3transfer writes downloads to a temporary file named "<name>.<8 hex chars>"
+# and atomically renames it into place on success. A hard kill/crash can orphan
+# one of these; this pattern lets us sweep them on a later run.
+_TEMP_SUFFIX_RE = re.compile(r'\.[0-9a-fA-F]{8}$')
 
 # At the beginning of the script, set the start method to 'fork' if available
 if hasattr(multiprocessing, 'get_start_method'):
@@ -110,6 +116,7 @@ class S3OptimizedDownloader:
                 logger.warning("No objects found to download. Exiting.")
                 return
 
+            self.cleanup_stale_temp_files()
             self.populate_queue()
             self.start_optimizer()
             self.start_workers()
@@ -129,6 +136,33 @@ class S3OptimizedDownloader:
             logger.error(f"An unexpected error occurred: {e}")
         finally:
             self.terminate_processes()
+
+    def cleanup_stale_temp_files(self):
+        """Remove orphaned s3transfer temp files (`<name>.<8 hex>`) left by
+        hard-killed downloads, which would otherwise accumulate on disk."""
+        expected = {
+            os.path.normpath(os.path.join(
+                self.destination, obj['Key'][len(self.prefix):].lstrip('/')))
+            for obj in self.objects
+        }
+        removed, reclaimed = 0, 0
+        for root, _dirs, files in os.walk(self.destination):
+            for name in files:
+                if not _TEMP_SUFFIX_RE.search(name):
+                    continue
+                path = os.path.join(root, name)
+                if os.path.normpath(path) in expected:
+                    continue  # real object that legitimately ends in .<8 hex>
+                try:
+                    reclaimed += os.path.getsize(path)
+                    os.remove(path)
+                    removed += 1
+                    logger.info(f"Removed stale temp file: {path}")
+                except OSError as e:
+                    logger.warning(f"Could not remove stale temp file {path}: {e}")
+        if removed:
+            logger.info(f"Cleaned up {removed} stale temp file(s), reclaimed "
+                        f"{reclaimed / (1024**2):.2f} MB")
 
     def populate_queue(self):
         for obj in self.objects:
@@ -276,7 +310,6 @@ class S3OptimizedDownloader:
                         should_download = False
                     else:
                         logger.info(f"File {key} is outdated, re-downloading")
-                        os.remove(dest_path)
                 else:
                     logger.info(f"File {key} exists with correct size, skipping download")
                     should_download = False
@@ -293,16 +326,11 @@ class S3OptimizedDownloader:
             )
 
             try:
-                if os.path.exists(dest_path):
-                    logger.info(f"Overwriting outdated file: {dest_path}")
-                    with open(dest_path, 'wb') as f:
-                        s3.download_fileobj(bucket, key, f, Config=config)
-                    downloaded_size = obj['Size']
-                else:
-                    # Start new download
-                    with open(dest_path, 'wb') as f:
-                        s3.download_fileobj(bucket, key, f, Config=config)
-                    downloaded_size = obj['Size']
+                # download_file downloads to a temp file and atomically renames
+                # it into place on success (and cleans up the temp on failure),
+                # so the destination is never left partial/corrupt.
+                s3.download_file(bucket, key, dest_path, Config=config)
+                downloaded_size = obj['Size']
 
                 # Update the local file's timestamp to match S3 if 'LastModified' is available
                 if 'LastModified' in obj:

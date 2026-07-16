@@ -314,6 +314,60 @@ def test_resume_interrupted_download(s3_client, test_bucket, unique_prefix):
 
     logger.info("Test completed, cleaning up...")
 
+def test_cleanup_stale_temp_files(s3_client, test_bucket, unique_prefix):
+    logger.info("Starting test_cleanup_stale_temp_files")
+    dest = '/tmp/test_destination'
+    os.makedirs(dest, exist_ok=True)
+
+    downloader = S3OptimizedDownloader(
+        test_bucket, unique_prefix, dest, 'us-east-1', 'http://seaweedfs:8333'
+    )
+    # A real object whose name legitimately ends in 8 hex chars must be kept.
+    real_key = f'{unique_prefix}data.deadbeef'
+    downloader.objects = [{'Key': real_key, 'Size': 4}]
+
+    real_path = os.path.join(dest, 'data.deadbeef')
+    with open(real_path, 'wb') as f:
+        f.write(b'real')
+    # An orphaned s3transfer temp file (`<name>.<8 hex>`) from a killed run.
+    orphan_path = os.path.join(dest, 'bigfile.txt.a1b2c3d4')
+    with open(orphan_path, 'wb') as f:
+        f.write(os.urandom(1024))
+    # An unrelated file whose suffix is not 8 hex chars.
+    normal_path = os.path.join(dest, 'keep.txt')
+    with open(normal_path, 'wb') as f:
+        f.write(b'keep')
+
+    downloader.cleanup_stale_temp_files()
+
+    assert not os.path.exists(orphan_path), "Orphaned temp file should be removed"
+    assert os.path.exists(real_path), "Real object ending in 8 hex chars must be preserved"
+    assert os.path.exists(normal_path), "Unrelated file must be preserved"
+
+def test_download_all_sweeps_stale_temp_files(s3_client, test_bucket, unique_prefix):
+    logger.info("Starting test_download_all_sweeps_stale_temp_files")
+    test_data = b'hello world'
+    s3_client.put_object(Bucket=test_bucket, Key=f'{unique_prefix}real_file.txt', Body=test_data)
+
+    dest = '/tmp/test_destination'
+    os.makedirs(dest, exist_ok=True)
+    # Simulate a temp file orphaned by a hard-killed previous run.
+    orphan_path = os.path.join(dest, 'real_file.txt.deadbeef')
+    with open(orphan_path, 'wb') as f:
+        f.write(os.urandom(4096))
+
+    downloader = S3OptimizedDownloader(
+        test_bucket, unique_prefix, dest, 'us-east-1', 'http://seaweedfs:8333'
+    )
+    downloader.download_all()
+
+    assert not os.path.exists(orphan_path), \
+        "download_all should sweep orphaned temp files on startup"
+    real_path = os.path.join(dest, 'real_file.txt')
+    assert os.path.exists(real_path), f"File not found at {real_path}"
+    with open(real_path, 'rb') as f:
+        assert f.read() == test_data
+
 def test_include_exclude_patterns(s3_client, test_bucket, unique_prefix):
     logger.info("Starting test_include_exclude_patterns")
     
